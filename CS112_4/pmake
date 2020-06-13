@@ -1,0 +1,269 @@
+#!/usr/bin/perl
+# Thomas Burch tburch1@ucsc.edu, Bryce Paine bpaine@ucsc.edu
+use strict;
+use warnings;
+use POSIX qw(locale_h);
+$0 =~ s|^(.*/)?([^/]+)/*$|$2|;
+
+my $term_signal = $? & 0x7F;
+my $core_dumped = $? & 0x80;
+my $exit_status = ($? >> 8) & 0xFF;
+END { exit $exit_status; }
+sub note(@) { print STDERR "$0: @_"; };
+$SIG{'__WARN__'} = sub { note @_; $exit_status = 1; };
+$SIG{'__DIE__'} = sub { warn @_; exit; };
+
+#Options are scanned 
+use Getopt::Std;
+my %OPTIONS = ();
+getopts ("dnf:", \%OPTIONS);
+
+# For Option -f: Get Makefile = filename.
+my $filename = 'Makefile';
+$filename = $OPTIONS{'f'} if $OPTIONS{'f'};
+
+# Get target.
+my $theTarget = "";
+$theTarget = $ARGV[0] if $ARGV[0];
+
+#(f) Keep all macros in a hash table.
+my %macro_hash= (); 
+
+##(h) Keep each target in a hash with the prerequisites
+# and commands as a reference to a list
+my %target_hash = ();
+my @has_prereq = ();
+my %cmd_hash = ();
+my $previous_target = "";
+
+# Need perl command-line argument variables to get a filename.
+# Set flags based on command-line flags.
+# $Id: cat.perl
+open my $file, "<$filename" or die "$0:$filename:$!\n";
+while (my $line = <$file>){
+    chomp($line);
+    $previous_target = &scan_line($line,\%macro_hash,\%target_hash,\%cmd_hash,\$previous_target);
+}
+foreach my $myMacro (keys %macro_hash){
+    my @check_list = @{$macro_hash{$myMacro}};
+    @check_list = &sub_macros(\@check_list,\%macro_hash);
+    $macro_hash{$myMacro} = [@check_list];
+}
+
+##(g) To extract the innermost macro substitution, the following pattern will avoid
+#nested macros : \${[^}]+}. Alternately, you may wish to parse macro lines
+#into an AST matching braces. Remember that regular expressions don’t handle
+#matched structures but context free grammars do.
+
+foreach my $target (@has_prereq){
+    if ($target =~ /\$\{([^\}]+)\}/){ #\${[^}]+}
+        my $replace = "";
+        my @replace_target = @{$macro_hash{$1}};
+        foreach my $str (@replace_target){$replace = $str;}
+        my @sub_list = @{$target_hash{$target}};
+        delete $target_hash{$target};
+        @{$target_hash{$replace}} = @sub_list;
+        $target = $replace;
+    }
+    my @check_list = @{$target_hash{$target}};
+    if (@check_list > 0){
+        @check_list = &sub_macros(\@check_list,\%macro_hash);
+        $target_hash{$target} = [@check_list];
+    }
+}
+
+foreach my $target (keys %cmd_hash){
+        if ($target =~ /\$\{([^\}]+)\}/){ #\${[^}]+}
+            my $replace = "";
+            my @replace_target = @{$macro_hash{$1}};
+            foreach my $str (@replace_target){$replace = $str;}
+            my @sub_list = @{$cmd_hash{$target}};
+            delete $cmd_hash{$target};
+            @{$cmd_hash{$replace}} = @sub_list;
+            $target = $replace;
+        }
+        my @check_list = @{$cmd_hash{$target}};
+        @check_list = &sub_macros(\@check_list,\%macro_hash);
+        $cmd_hash{$target} = [@check_list];
+}
+#-------------------------------------------------------------------------
+&if_percent();
+
+#If any target is obsolete, the following commands
+#are executed.
+my @prereq_total = ($theTarget);
+my $has_tar = grep /$theTarget/, @has_prereq;
+my $mtime = 0;
+my @filestat = stat $filename;
+if (@filestat > 0){
+    $mtime = $filestat[9];
+#    execute_timestamp ($theTarget, $mtime);
+} 
+
+if ($has_tar){
+    my @start_pre = @{$target_hash{$theTarget}};
+    &get_prereq(\@start_pre);
+}
+
+#(i) The stat function returns a list of file attributes. The modification time is the
+#value of interest when comparing time stamps on files.
+
+#    sub execute_timestamp{
+#    my $Target = $_[0];
+#    my $timestamps = $_[1];
+
+foreach my $execute (@prereq_total){ 
+    if (exists $cmd_hash{$execute}){
+        my @cmd_list = @{$cmd_hash{$execute}};
+        my $cmd_string = "";
+        foreach my $cmd (@cmd_list){
+            if ($cmd ne "\n" and $cmd ne "-"){
+                $cmd_string = $cmd_string . $cmd . " ";
+            }elsif ($cmd eq "\n"){
+                $cmd_string =~ s/\s+$//;
+                print "$cmd_string\n";
+                #(e) Use the function system to run the command.
+                system($cmd_string);
+                if ($? > 0){
+                    my @cmd_list = split(" ",$cmd_string);
+                    #$? is the wait(2) exit status. 
+                    $exit_status = $?;
+                    die "$0:$cmd_list[0] returned $exit_status:$!\n";
+                }
+                $cmd_string = "";
+            }
+        }
+    }
+}
+
+#Checks a line for a macro, target or cmd. Places corresponding value into
+#the correct hash
+sub scan_line {
+    my $input_line = $_[0];
+    my $macro_hash = $_[1];
+    my $target_hash = $_[2];
+    my $cmd_hash = $_[3];
+    my $prev_target = $_[4];
+
+    if($input_line !~ /^#.+/){
+        if ($input_line =~ /\s*(\S+)\s*=\s+(.+)/){
+            my $macro = $1;
+            my $value = $2;
+            my @split_val = ();
+            @split_val = split(" ", $value);
+            $macro_hash->{$macro} = [@split_val];
+        }
+        elsif($input_line =~ /\s*(\S+)\s*:.*/ and $input_line !~ /\t\s*.+/){
+            my $target = $1;
+            if ($theTarget eq "") {$theTarget = $target;}
+            $previous_target = $target;
+            if($input_line =~ /.+:\s+(.+)/){
+                my @split_val = ();
+                @split_val = split(" ", $1);
+                $target_hash->{$target} = [@split_val];
+                push(@has_prereq,$target);
+            }
+            else{
+                $target_hash->{$target} = "";
+            }
+        }
+        elsif ($input_line =~ /\t\s*(.+)/){
+            my $cmd = $1;
+            my @split_val = ();
+            if (exists $cmd_hash->{$previous_target}){
+               @split_val = split( " ", $cmd);
+               push(@{$cmd_hash->{$previous_target}}, @split_val);
+               push(@{$cmd_hash->{$previous_target}}, "\n");
+            }
+            else {
+                $cmd_hash->{$previous_target} = ();
+                @split_val = split( " ", $cmd);
+                push(@{$cmd_hash->{$previous_target}}, @split_val);
+                push(@{$cmd_hash->{$previous_target}}, "\n");
+            }
+        }
+    }
+   return $previous_target;
+}
+
+## This function fetches the prerequisites for the target passed into it.
+sub get_prereq {
+    my @pre_list = @{$_[0]};
+    foreach my $target (@pre_list){
+        my $has_tar = grep /$target/, @has_prereq;
+        if ($has_tar){
+            my @pass_pre = @{$target_hash{$target}};
+            &get_prereq(\@pass_pre);
+        }
+        push(@prereq_total, $target);
+    }
+}
+
+# If the target or prerequisite contains a if_percent sign (%)
+# it is substituted consistently.
+sub if_percent {
+    my $exists;
+    my $if_percent = "";
+    foreach my $target (keys %target_hash){
+        if ($target =~ /^%(.+)/){
+            $exists = 1;
+            $if_percent = $1;
+        }
+    }
+    if ($exists) {
+        foreach my $macro (keys %macro_hash){
+            my @value_list = @{$macro_hash{$macro}};
+            foreach my $value (@value_list){
+                if ($value =~ /((\w*)($if_percent)$)/){
+                    $value =~ s/(.*)\..*/$1/;
+                    my $target = $value . $if_percent;
+                    my $get =  "%" . $if_percent;
+                    my @pre_req = @{$target_hash{$get}};
+                    $pre_req[0] =~ s/^.//;
+                    $pre_req[0] = $value . $pre_req[0];
+                    my @command = @{$cmd_hash{$get}};
+                    foreach my $str (@command){
+                        $str =~ s/\$\</$pre_req[0]/;
+                    }
+                    $target_hash{$target} = @pre_req;
+                    $cmd_hash{$target} = [@command];
+                }
+            }
+        }
+
+    }
+}
+
+sub sub_macros {
+    my @input_line = @{$_[0]};
+    my $macro_hash = $_[1];
+    my $done_string = "";
+    for(my $count = 0; $count < @input_line; $count++){
+       my $value = $input_line[$count];
+       if ($value =~ /(\S+)?\$\{([^\}]+)\}(\S+)?/){
+	  my $pre = $1;
+	  my $post = $3;
+          if ($2 eq "MAKE"){
+              my @pmake_list = ("pmake");
+              splice @input_line, $count, 1, @pmake_list;
+          }
+          else{
+              my @sub_list = @{$macro_hash->{$2}};
+	      $sub_list[0] = $pre . $sub_list[0] if $pre;
+	      $sub_list[-1] = $sub_list[-1] . $post if $post;
+              splice @input_line, $count, 1, @sub_list;
+          }
+		 }
+       elsif ($value =~ /\$\{([^\}]+)\}/){
+          if ($1 eq "MAKE"){
+              my @pmake_list = ("pmake");
+              splice @input_line, $count, 1, @pmake_list;
+          }
+          else{
+              my @sub_list = @{$macro_hash->{$1}};
+              splice @input_line, $count, 1, @sub_list;
+          }
+       }
+    }
+    return @input_line;
+}
